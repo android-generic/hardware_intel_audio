@@ -36,7 +36,6 @@ LOCAL_C_INCLUDES += \
 	$(call include-path-for, audio-effects)
 
 LOCAL_CFLAGS :=\
- -fno-strict-overflow \
  -fwrapv \
  -D_FORTIFY_SOURCE=2 \
  -fstack-protector-strong \
