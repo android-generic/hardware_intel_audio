@@ -38,19 +38,43 @@ enum update_direction {
     DIRECTION_REVERSE_RESET
 };
 
-union ctl_values {
-    int *enumerated;
-    long *integer;
-    void *ptr;
-    unsigned char *bytes;
+/*
+ "ctl_values" couples the buffer pointer with a variable "byte_size" to store
+ both types of ctl setting as below in respective ways.
+
+                    | fixed-length            | tlv-typed byte ctl [note 1]
+                    | byte/int/enum ctl       |
+ -------------------+-------------------------+--------------------------------
+  alloc buffer size | num_values * size(type) | num_values * 1     [note 2]
+                    +                         +
+  stored value size | always as the full size | can be any size from 1 up to
+                    | of allocated buffer     | num_values
+                    +                         +
+  "byte_size" value | equal to buffer size,   | equal to stored value size,
+                    | fixed in runtime        | variable according to setting
+
+ additional notes:
+ [1] tlv-typed read/write is not a byte-specific feature but by now it only
+     supports for byte ctls via Tinyalsa API
+ [2] num_values is obtained from mixer_ctl_get_num_values()
+ */
+struct ctl_values {
+    /* anonymous union */
+    union {
+        int *enumerated;
+        long *integer;
+        void *ptr;
+        unsigned char *bytes;
+    };
+    unsigned int byte_size;
 };
 
 struct mixer_state {
     struct mixer_ctl *ctl;
     unsigned int num_values;
-    union ctl_values old_value;
-    union ctl_values new_value;
-    union ctl_values reset_value;
+    struct ctl_values old_value;
+    struct ctl_values new_value;
+    struct ctl_values reset_value;
     unsigned int active_count;
 };
 
@@ -58,7 +82,7 @@ struct mixer_setting {
     unsigned int ctl_index;
     unsigned int num_values;
     unsigned int type;
-    union ctl_values value;
+    struct ctl_values value;
 };
 
 struct mixer_value {
@@ -72,6 +96,7 @@ struct mixer_value {
      or top level initial setting value
      */
     long *values;
+    unsigned int num_values_in_array;
 };
 
 struct mixer_path {
@@ -97,6 +122,40 @@ struct config_parse_state {
     int level;
     bool enum_mixer_numeric_fallback;
 };
+
+static size_t sizeof_ctl_type(enum mixer_ctl_type type);
+
+static bool ctl_is_tlv_byte_type(struct mixer_ctl *ctl)
+{
+    return mixer_ctl_get_type(ctl) == MIXER_CTL_TYPE_BYTE && mixer_ctl_is_access_tlv_rw(ctl);
+}
+
+/* ctl_values helper functions */
+
+static int ctl_values_alloc(struct ctl_values *value, unsigned int num_values,
+                            enum mixer_ctl_type type)
+{
+    void *ptr;
+    size_t value_sz = sizeof_ctl_type(type);
+
+    ptr = calloc(num_values, value_sz);
+    if (!ptr)
+        return -1;
+
+    value->ptr = ptr;
+    value->byte_size = num_values * value_sz;
+    return 0;
+}
+
+static void ctl_values_copy(struct ctl_values *dst, const struct ctl_values *src)
+{
+    /*
+     this should only be used for copying among "ctl_values"-es of a "mixer_state", all of them
+     will be allocated the same size of buffers according to "num_values" obtained from mixer ctl.
+     */
+    memcpy(dst->ptr, src->ptr, src->byte_size);
+    dst->byte_size = src->byte_size;
+}
 
 /* path functions */
 
@@ -278,6 +337,7 @@ static int path_add_setting(struct audio_route *ar, struct mixer_path *path,
                             struct mixer_setting *setting)
 {
     int path_index;
+    int rc;
 
     if (find_ctl_index_in_path(path, setting->ctl_index) != -1) {
         struct mixer_ctl *ctl = index_to_ctl(ar, setting->ctl_index);
@@ -300,12 +360,13 @@ static int path_add_setting(struct audio_route *ar, struct mixer_path *path,
     path->setting[path_index].type = setting->type;
     path->setting[path_index].num_values = setting->num_values;
 
-    size_t value_sz = sizeof_ctl_type(setting->type);
-
-    path->setting[path_index].value.ptr = calloc(setting->num_values, value_sz);
+    rc = ctl_values_alloc(&path->setting[path_index].value, setting->num_values, setting->type);
+    if (rc < 0) {
+        ALOGE("failed to allocate mem for path setting");
+        return rc;
+    }
     /* copy all values */
-    memcpy(path->setting[path_index].value.ptr, setting->value.ptr,
-           setting->num_values * value_sz);
+    ctl_values_copy(&path->setting[path_index].value, &setting->value);
 
     return 0;
 }
@@ -317,6 +378,7 @@ static int path_add_value(struct audio_route *ar, struct mixer_path *path,
     int path_index;
     unsigned int num_values;
     struct mixer_ctl *ctl;
+    int rc;
 
     /* Check that mixer value index is within range */
     ctl = index_to_ctl(ar, mixer_value->ctl_index);
@@ -345,8 +407,11 @@ static int path_add_value(struct audio_route *ar, struct mixer_path *path,
         path->setting[path_index].num_values = num_values;
         path->setting[path_index].type = type;
 
-        size_t value_sz = sizeof_ctl_type(type);
-        path->setting[path_index].value.ptr = calloc(num_values, value_sz);
+        rc = ctl_values_alloc(&path->setting[path_index].value, num_values, type);
+        if (rc < 0) {
+            ALOGE("failed to allocate mem for path setting");
+            return rc;
+        }
         if (path->setting[path_index].type == MIXER_CTL_TYPE_BYTE)
             path->setting[path_index].value.bytes[0] = mixer_value->value;
         else if (path->setting[path_index].type == MIXER_CTL_TYPE_ENUM)
@@ -358,8 +423,10 @@ static int path_add_value(struct audio_route *ar, struct mixer_path *path,
     if (mixer_value->index == -1) {
         /* set all values the same except for CTL_TYPE_BYTE and CTL_TYPE_INT */
         if (path->setting[path_index].type == MIXER_CTL_TYPE_BYTE) {
-            for (i = 0; i < num_values; i++)
+            /* update the number of values (bytes) from input "mixer_value" */
+            for (i = 0; i < mixer_value->num_values_in_array; i++)
                 path->setting[path_index].value.bytes[i] = mixer_value->values[i];
+            path->setting[path_index].value.byte_size = mixer_value->num_values_in_array;
         } else if (path->setting[path_index].type == MIXER_CTL_TYPE_INT) {
             for (i = 0; i < num_values; i++)
                 path->setting[path_index].value.integer[i] = mixer_value->values[i];
@@ -414,9 +481,7 @@ static int path_apply(struct audio_route *ar, struct mixer_path *path)
         type = mixer_ctl_get_type(ctl);
         if (!is_supported_ctl_type(type))
             continue;
-        size_t value_sz = sizeof_ctl_type(type);
-        memcpy(ar->mixer_state[ctl_index].new_value.ptr, path->setting[i].value.ptr,
-                   path->setting[i].num_values * value_sz);
+        ctl_values_copy(&ar->mixer_state[ctl_index].new_value, &path->setting[i].value);
     }
 
     return 0;
@@ -436,11 +501,9 @@ static int path_reset(struct audio_route *ar, struct mixer_path *path)
         type = mixer_ctl_get_type(ctl);
         if (!is_supported_ctl_type(type))
             continue;
-        size_t value_sz = sizeof_ctl_type(type);
         /* reset the value(s) */
-        memcpy(ar->mixer_state[ctl_index].new_value.ptr,
-               ar->mixer_state[ctl_index].reset_value.ptr,
-               ar->mixer_state[ctl_index].num_values * value_sz);
+        ctl_values_copy(&ar->mixer_state[ctl_index].new_value,
+                        &ar->mixer_state[ctl_index].reset_value);
     }
 
     return 0;
@@ -510,6 +573,7 @@ static void start_tag(void *data, const XML_Char *tag_name,
     struct mixer_value mixer_value;
     enum mixer_ctl_type type;
     long* value_array = NULL;
+    unsigned int num_values_in_array = 0;
 
     /* Get name, id and value attributes (these may be empty) */
     for (i = 0; attr[i]; i += 2) {
@@ -580,6 +644,12 @@ static void start_tag(void *data, const XML_Char *tag_name,
                 for (i = 0; i < num_values; i++) {
                     attr_sub_value = strtok_r((char *)attr_value, " ", &test_r);
                     if (attr_sub_value == NULL) {
+                        /* the length of setting for tlv-typed byte control
+                           can be any size up to num_value; break the loop so
+                           the current count of values will be recorded */
+                        if (ctl_is_tlv_byte_type(ctl))
+                            break;
+
                         ALOGE("expect %d values but only %d specified for ctl %s",
                             num_values, i, attr_name);
                         goto done;
@@ -589,6 +659,9 @@ static void start_tag(void *data, const XML_Char *tag_name,
                     else
                         value_array[i] =
                            (unsigned char) strtol((char *)attr_sub_value, NULL, 16);
+
+                    /* count the number of values written in array */
+                    num_values_in_array++;
 
                     if (attr_id)
                         break;
@@ -636,6 +709,12 @@ static void start_tag(void *data, const XML_Char *tag_name,
                     else
                         ALOGW("value id out of range for mixer ctl '%s'",
                               mixer_ctl_get_name(ctl));
+                } else if (ctl_is_tlv_byte_type(ctl)) {
+                    /* for tlv-typed ctl, only set the number of values (bytes) carried by array,
+                       and update the number of bytes */
+                    for (i = 0; i < num_values_in_array; i++)
+                        ar->mixer_state[ctl_index].new_value.bytes[i] = value_array[i];
+                    ar->mixer_state[ctl_index].new_value.byte_size = num_values_in_array;
                 } else {
                     /* set all values the same except for CTL_TYPE_BYTE and CTL_TYPE_INT */
                     for (i = 0; i < ar->mixer_state[ctl_index].num_values; i++)
@@ -656,6 +735,7 @@ static void start_tag(void *data, const XML_Char *tag_name,
                 mixer_ctl_get_type(ctl) == MIXER_CTL_TYPE_INT) {
                 mixer_value.values = value_array;
                 mixer_value.value = value_array[0];
+                mixer_value.num_values_in_array = num_values_in_array;
             } else {
                 mixer_value.value = value;
             }
@@ -707,18 +787,21 @@ static int alloc_mixer_state(struct audio_route *ar)
         if (!is_supported_ctl_type(type))
             continue;
 
-        size_t value_sz = sizeof_ctl_type(type);
-        ar->mixer_state[i].old_value.ptr = calloc(num_values, value_sz);
-        ar->mixer_state[i].new_value.ptr = calloc(num_values, value_sz);
-        ar->mixer_state[i].reset_value.ptr = calloc(num_values, value_sz);
+        /*
+         for tlv-typed ctl, "mixer_ctl_get_num_values()" returns the max length of a
+         setting data. The buffer size allocated per mixer setting should align the
+         max length to be capable of carrying any length of data.
+         */
+        ctl_values_alloc(&ar->mixer_state[i].old_value, num_values, type);
+        ctl_values_alloc(&ar->mixer_state[i].new_value, num_values, type);
+        ctl_values_alloc(&ar->mixer_state[i].reset_value, num_values, type);
 
         if (type == MIXER_CTL_TYPE_ENUM)
             ar->mixer_state[i].old_value.enumerated[0] = mixer_ctl_get_value(ctl, 0);
         else
             mixer_ctl_get_array(ctl, ar->mixer_state[i].old_value.ptr, num_values);
 
-        memcpy(ar->mixer_state[i].new_value.ptr, ar->mixer_state[i].old_value.ptr,
-               num_values * value_sz);
+        ctl_values_copy(&ar->mixer_state[i].new_value, &ar->mixer_state[i].old_value);
     }
 
     return 0;
@@ -743,15 +826,52 @@ static void free_mixer_state(struct audio_route *ar)
     ar->mixer_state = NULL;
 }
 
+static void mixer_set_value_if_changed(struct mixer_state *ms)
+{
+    unsigned int i;
+    struct mixer_ctl *ctl = ms->ctl;
+    enum mixer_ctl_type type = mixer_ctl_get_type(ctl);
+
+    if (type == MIXER_CTL_TYPE_BYTE) {
+        unsigned int num_bytes;
+        /*
+         for tlv-typed ctl, "mixer_ctl_set_array()" should specify the length of data to
+         be set, thus the data can be wrapped into tlv format correctly by Tinyalsa.
+         */
+        num_bytes = ctl_is_tlv_byte_type(ctl) ? ms->new_value.byte_size : ms->num_values;
+        for (i = 0; i < num_bytes; i++) {
+            if (ms->old_value.bytes[i] != ms->new_value.bytes[i]) {
+                mixer_ctl_set_array(ctl, ms->new_value.ptr, num_bytes);
+                ctl_values_copy(&ms->old_value, &ms->new_value);
+                return;
+            }
+        }
+    } else if (type == MIXER_CTL_TYPE_ENUM) {
+        for (i = 0; i < ms->num_values; i++) {
+            if (ms->old_value.enumerated[i] != ms->new_value.enumerated[i]) {
+                mixer_ctl_set_value(ctl, 0, ms->new_value.enumerated[0]);
+                ctl_values_copy(&ms->old_value, &ms->new_value);
+                return;
+            }
+        }
+    } else {
+        for (i = 0; i < ms->num_values; i++) {
+            if (ms->old_value.integer[i] != ms->new_value.integer[i]) {
+                mixer_ctl_set_array(ctl, ms->new_value.ptr, ms->num_values);
+                ctl_values_copy(&ms->old_value, &ms->new_value);
+                return;
+            }
+        }
+    }
+}
+
 /* Update the mixer with any changed values */
 int audio_route_update_mixer(struct audio_route *ar)
 {
     unsigned int i;
-    unsigned int j;
     struct mixer_ctl *ctl;
 
     for (i = 0; i < ar->num_mixer_ctls; i++) {
-        unsigned int num_values = ar->mixer_state[i].num_values;
         enum mixer_ctl_type type;
 
         ctl = ar->mixer_state[i].ctl;
@@ -762,40 +882,7 @@ int audio_route_update_mixer(struct audio_route *ar)
             continue;
 
         /* if the value has changed, update the mixer */
-        bool changed = false;
-        if (type == MIXER_CTL_TYPE_BYTE) {
-            for (j = 0; j < num_values; j++) {
-                if (ar->mixer_state[i].old_value.bytes[j] != ar->mixer_state[i].new_value.bytes[j]) {
-                    changed = true;
-                    break;
-                }
-            }
-         } else if (type == MIXER_CTL_TYPE_ENUM) {
-             for (j = 0; j < num_values; j++) {
-                 if (ar->mixer_state[i].old_value.enumerated[j]
-                         != ar->mixer_state[i].new_value.enumerated[j]) {
-                     changed = true;
-                     break;
-                 }
-             }
-         } else {
-            for (j = 0; j < num_values; j++) {
-                if (ar->mixer_state[i].old_value.integer[j] != ar->mixer_state[i].new_value.integer[j]) {
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        if (changed) {
-            if (type == MIXER_CTL_TYPE_ENUM)
-                mixer_ctl_set_value(ctl, 0, ar->mixer_state[i].new_value.enumerated[0]);
-            else
-                mixer_ctl_set_array(ctl, ar->mixer_state[i].new_value.ptr, num_values);
-
-            size_t value_sz = sizeof_ctl_type(type);
-            memcpy(ar->mixer_state[i].old_value.ptr, ar->mixer_state[i].new_value.ptr,
-                   num_values * value_sz);
-        }
+        mixer_set_value_if_changed(&ar->mixer_state[i]);
     }
 
     return 0;
@@ -812,9 +899,7 @@ static void save_mixer_state(struct audio_route *ar)
         if (!is_supported_ctl_type(type))
             continue;
 
-        size_t value_sz = sizeof_ctl_type(type);
-        memcpy(ar->mixer_state[i].reset_value.ptr, ar->mixer_state[i].new_value.ptr,
-               ar->mixer_state[i].num_values * value_sz);
+        ctl_values_copy(&ar->mixer_state[i].reset_value, &ar->mixer_state[i].new_value);
     }
 }
 
@@ -830,9 +915,7 @@ void audio_route_reset(struct audio_route *ar)
         if (!is_supported_ctl_type(type))
             continue;
 
-        size_t value_sz = sizeof_ctl_type(type);
-        memcpy(ar->mixer_state[i].new_value.ptr, ar->mixer_state[i].reset_value.ptr,
-            ar->mixer_state[i].num_values * value_sz);
+        ctl_values_copy(&ar->mixer_state[i].new_value, &ar->mixer_state[i].reset_value);
     }
 }
 
@@ -914,60 +997,21 @@ static int audio_route_update_path(struct audio_route *ar, const char *name, int
         }
 
         if (reverse && ms->active_count > 0) {
-            if (force_reset)
+            if (force_reset) {
                 ms->active_count = 0;
-            else
-                ms->active_count--;
+            } else if (--ms->active_count > 0) {
+                ALOGD("%s: skip to reset mixer control '%s' in path '%s' "
+                    "because it is still needed by other paths", __func__,
+                    mixer_ctl_get_name(ms->ctl), name);
+                ctl_values_copy(&ms->new_value, &ms->old_value);
+                continue;
+            }
         } else if (!reverse) {
             ms->active_count++;
         }
 
-       size_t value_sz = sizeof_ctl_type(type);
         /* if any value has changed, update the mixer */
-        for (j = 0; j < ms->num_values; j++) {
-            if (type == MIXER_CTL_TYPE_BYTE) {
-                if (ms->old_value.bytes[j] != ms->new_value.bytes[j]) {
-                    if (reverse && ms->active_count > 0) {
-                        ALOGD("%s: skip to reset mixer control '%s' in path '%s' "
-                            "because it is still needed by other paths", __func__,
-                            mixer_ctl_get_name(ms->ctl), name);
-                        memcpy(ms->new_value.bytes, ms->old_value.bytes,
-                            ms->num_values * value_sz);
-                        break;
-                    }
-                    mixer_ctl_set_array(ms->ctl, ms->new_value.bytes, ms->num_values);
-                    memcpy(ms->old_value.bytes, ms->new_value.bytes, ms->num_values * value_sz);
-                    break;
-                }
-            } else if (type == MIXER_CTL_TYPE_ENUM) {
-                if (ms->old_value.enumerated[j] != ms->new_value.enumerated[j]) {
-                    if (reverse && ms->active_count > 0) {
-                        ALOGD("%s: skip to reset mixer control '%s' in path '%s' "
-                            "because it is still needed by other paths", __func__,
-                            mixer_ctl_get_name(ms->ctl), name);
-                        memcpy(ms->new_value.enumerated, ms->old_value.enumerated,
-                            ms->num_values * value_sz);
-                        break;
-                    }
-                    mixer_ctl_set_value(ms->ctl, 0, ms->new_value.enumerated[0]);
-                    memcpy(ms->old_value.enumerated, ms->new_value.enumerated,
-                            ms->num_values * value_sz);
-                    break;
-                }
-            } else if (ms->old_value.integer[j] != ms->new_value.integer[j]) {
-                if (reverse && ms->active_count > 0) {
-                    ALOGD("%s: skip to reset mixer control '%s' in path '%s' "
-                        "because it is still needed by other paths", __func__,
-                        mixer_ctl_get_name(ms->ctl), name);
-                    memcpy(ms->new_value.integer, ms->old_value.integer,
-                        ms->num_values * value_sz);
-                    break;
-                }
-                mixer_ctl_set_array(ms->ctl, ms->new_value.integer, ms->num_values);
-                memcpy(ms->old_value.integer, ms->new_value.integer, ms->num_values * value_sz);
-                break;
-            }
-        }
+        mixer_set_value_if_changed(ms);
     }
     return 0;
 }
