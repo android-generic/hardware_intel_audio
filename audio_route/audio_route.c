@@ -556,6 +556,50 @@ static int mixer_enum_string_to_value(struct mixer_ctl *ctl, const char *string,
     return i;
 }
 
+static int mixer_get_bytes_from_file(long **value_array, const char *filepath,
+                                     unsigned int max_bytes)
+{
+    unsigned char *buf = NULL;
+    long *values = NULL;
+    int bytes_read = -1;
+    unsigned int i;
+
+    FILE *file = fopen(filepath, "rb");
+    if (!file) {
+        ALOGE("Failed to open %s: %s", filepath, strerror(errno));
+        return -1;
+    }
+
+    buf = calloc(max_bytes, 1);
+    if (!buf) {
+        ALOGE("failed to allocate mem for file read buffer");
+        goto exit;
+    }
+
+    bytes_read = fread(buf, 1, max_bytes, file);
+    if (bytes_read < 0) {
+        ALOGE("failed to read data from file, rc: %d", bytes_read);
+        goto exit;
+    }
+
+    values = calloc(bytes_read, sizeof(long));
+    if (!values) {
+        ALOGE("failed to allocate mem for values array");
+        bytes_read = -1;
+        goto exit;
+    }
+
+    for (i = 0; i < bytes_read; i++) {
+        values[i] = (long)buf[i];
+    }
+    *value_array = values;
+
+exit:
+    free(buf);
+    fclose(file);
+    return bytes_read;
+}
+
 static void start_tag(void *data, const XML_Char *tag_name,
                       const XML_Char **attr)
 {
@@ -563,6 +607,7 @@ static void start_tag(void *data, const XML_Char *tag_name,
     const XML_Char *attr_id = NULL;
     const XML_Char *attr_value = NULL;
     const XML_Char *attr_enum_mixer_numeric_fallback = NULL;
+    const XML_Char *attr_bin = NULL;
     struct config_parse_state *state = data;
     struct audio_route *ar = state->ar;
     unsigned int i;
@@ -585,6 +630,8 @@ static void start_tag(void *data, const XML_Char *tag_name,
             attr_value = attr[i + 1];
         else if (strcmp(attr[i], "enum_mixer_numeric_fallback") == 0)
             attr_enum_mixer_numeric_fallback = attr[i + 1];
+        else if (strcmp(attr[i], "bin") == 0)
+            attr_bin = attr[i + 1];
     }
 
     /* Look at tags */
@@ -630,12 +677,28 @@ static void start_tag(void *data, const XML_Char *tag_name,
         case MIXER_CTL_TYPE_INT:
         case MIXER_CTL_TYPE_BYTE: {
                 char *attr_sub_value, *test_r;
+                unsigned int num_values = mixer_ctl_get_num_values(ctl);
+
+                if (attr_bin && mixer_ctl_get_type(ctl) == MIXER_CTL_TYPE_BYTE) {
+                    /* get byte values from binfile */
+                    int bytes_read = mixer_get_bytes_from_file(&value_array, attr_bin, num_values);
+                    if (bytes_read <= 0) {
+                        ALOGE("failed to get bytes from file '%s'", attr_bin);
+                        goto done;
+                    }
+                    if (bytes_read < num_values && mixer_ctl_is_access_tlv_rw(ctl) == 0) {
+                        ALOGE("expect %d values but only %d specified for ctl %s",
+                              num_values, bytes_read, attr_name);
+                        goto done;
+                    }
+                    num_values_in_array = bytes_read;
+                    break;
+                }
 
                 if (attr_value == NULL) {
                     ALOGE("No value specified for ctl %s", attr_name);
                     goto done;
                 }
-                unsigned int num_values = mixer_ctl_get_num_values(ctl);
                 value_array = calloc(num_values, sizeof(long));
                 if (!value_array) {
                     ALOGE("failed to allocate mem for ctl %s", attr_name);
