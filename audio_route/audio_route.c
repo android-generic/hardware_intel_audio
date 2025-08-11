@@ -1031,7 +1031,6 @@ int audio_route_reset_path(struct audio_route *ar, const char *name)
 static int audio_route_update_path(struct audio_route *ar, const char *name, int direction)
 {
     struct mixer_path *path;
-    unsigned int j;
     bool reverse = direction != DIRECTION_FORWARD;
     bool force_reset = direction == DIRECTION_REVERSE_RESET;
 
