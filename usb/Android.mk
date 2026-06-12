@@ -26,14 +26,16 @@ LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libaudioutils \
         libalsautils \
+	libexpat \
 	libtinyalsa \
-	libaudioroute \
 	libdl
+
+LOCAL_STATIC_LIBRARIES := libaudioroute_custom
 
 LOCAL_C_INCLUDES += \
 	external/tinyalsa/include \
+	$(LOCAL_PATH)/../audio_route \
 	$(call include-path-for, audio-utils) \
-	$(call include-path-for, audio-route) \
 	$(call include-path-for, audio-effects)
 
 LOCAL_CFLAGS :=\

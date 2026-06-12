@@ -1,0 +1,25 @@
+cc_defaults {
+    name: "libaudioroute_custom_defaults",
+    vendor_available: true,
+    host_supported: true,
+    srcs: ["audio_route.c"],
+    export_include_dirs: ["include"],
+    shared_libs: [
+        "libcutils",
+        "libexpat",
+        "liblog",
+        "libutils",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
+
+cc_library_static {
+    name: "libaudioroute_custom",
+    defaults: ["libaudioroute_custom_defaults"],
+    shared_libs: [
+        "libtinyalsa",
+    ],
+}
