@@ -48,13 +48,17 @@
 #define PCM_DEVICE 0
 
 #define OUT_PERIOD_SIZE 1024
-#define OUT_PERIOD_COUNT 4
+#define OUT_SHORT_PERIOD_COUNT 2
+#define OUT_LONG_PERIOD_COUNT 8
+#define OUT_PERIOD_COUNT OUT_SHORT_PERIOD_COUNT
 #define OUT_SAMPLING_RATE 48000
+#define OUT_SAMPLING_RATE_FALLBACK 44100
 
 #define IN_PERIOD_SIZE 1024 //default period size
 #define IN_PERIOD_MS 10
 #define IN_PERIOD_COUNT 4
 #define IN_SAMPLING_RATE 48000
+#define IN_SAMPLING_RATE_FALLBACK 44100
 
 #define AUDIO_PARAMETER_HFP_ENABLE   "hfp_enable"
 #define AUDIO_PARAMETER_BT_SCO       "BT_SCO"
@@ -129,7 +133,8 @@ struct audio_device {
     bool standby;
     bool mic_mute;
     struct audio_route *ar;
-    
+    bool screen_off;
+
     int card;
     int cardc;
     struct stream_out *active_out;
@@ -258,6 +263,115 @@ static int get_pcm_card(const char* name)
         return atoi(number_filepath + 4);
 }
 
+/*
+ * parse_pcm_node() - Parse a /dev/snd/ PCM node name like "pcmC0D0p".
+ *
+ * Format: pcmC<card>D<device><p|c>
+ *   - 'p' = playback (PCM_OUT)
+ *   - 'c' = capture  (PCM_IN)
+ *
+ * @node_name: The node name to parse (e.g., "pcmC0D0p" or "pcmC1D3c").
+ * @out_card: Output pointer for the parsed card number.
+ * @out_device: Output pointer for the parsed device number.
+ * @direction: Expected direction (PCM_OUT or PCM_IN). Returns -1 if mismatched.
+ *
+ * Returns 0 on success, -1 on parse failure or direction mismatch.
+ */
+static int parse_pcm_node(const char *node_name, int *out_card, int *out_device,
+                           unsigned int direction)
+{
+    int card_num, device_num;
+    char dir_char;
+
+    if (sscanf(node_name, "pcmC%dD%d%c", &card_num, &device_num, &dir_char) != 3)
+        return -1;
+
+    /* Validate direction character */
+    if (dir_char == 'p' && direction != PCM_OUT)
+        return -1;
+    if (dir_char == 'c' && direction != PCM_IN)
+        return -1;
+    if (dir_char != 'p' && dir_char != 'c')
+        return -1;
+
+    /* Validate the node actually exists in /dev/snd/ */
+    char dev_path[PATH_MAX];
+    snprintf(dev_path, sizeof(dev_path), "/dev/snd/%s", node_name);
+    if (access(dev_path, F_OK) != 0) {
+        ALOGW("%s: node '%s' does not exist", __func__, dev_path);
+        return -1;
+    }
+
+    *out_card = card_num;
+    *out_device = device_num;
+    return 0;
+}
+
+/*
+ * find_card() - Unified card discovery with property override support.
+ *
+ * The property value supports two formats:
+ *   - /proc/asound name:  e.g. "PCH", "Intel", "sofhdadsp"
+ *   - /dev/snd node name: e.g. "pcmC0D0p", "pcmC1D0c"
+ *
+ * Fallback chain:
+ *   1. Check vendor.hal.* property for the given prop_key (if non-NULL)
+ *   2. Try Celadon's standard chain: PCH -> Intel -> sofhdadsp -> Dummy
+ *   3. Return -1 if nothing found
+ *
+ * @prop_key: Property name to check (e.g., "vendor.hal.audio.out"), or NULL to skip.
+ * @direction: PCM_OUT or PCM_IN, used to validate the card supports the direction.
+ */
+static int find_card(const char *prop_key, unsigned int direction)
+{
+    char prop_value[PROPERTY_VALUE_MAX];
+    int card;
+
+    /* Step 1: Check property override */
+    if (prop_key && property_get(prop_key, prop_value, NULL) > 0) {
+        int dev;
+
+        /* Try as /dev/snd/ node name first (e.g. "pcmC0D0p") */
+        if (parse_pcm_node(prop_value, &card, &dev, direction) == 0) {
+            ALOGI("%s: using card %d device %d from node '%s' (property '%s')",
+                  __func__, card, dev, prop_value, prop_key);
+            return card;
+        }
+
+        /* Try as /proc/asound/ card name (e.g. "PCH") */
+        card = get_pcm_card(prop_value);
+        if (card >= 0) {
+            ALOGI("%s: using card '%s' (card %d) from property '%s'",
+                  __func__, prop_value, card, prop_key);
+            return card;
+        }
+
+        ALOGW("%s: property '%s' set to '%s' but card not found, trying defaults",
+              __func__, prop_key, prop_value);
+    }
+
+    /* Step 2: Celadon's standard card name chain */
+    static const char *card_names[] = { "PCH", "Intel", "sofhdadsp", "Dummy", NULL };
+    for (int i = 0; card_names[i] != NULL; i++) {
+        card = get_pcm_card(card_names[i]);
+        if (card >= 0) {
+            struct pcm_params *params = pcm_params_get(card, PCM_DEVICE, direction);
+            if (params) {
+                free(params);
+                ALOGI("%s: found card '%s' (card %d)", __func__, card_names[i], card);
+                return card;
+            }
+            /* Card exists but doesn't support this direction, keep trying */
+            ALOGW("%s: card '%s' (card %d) found but no %s support",
+                  __func__, card_names[i], card,
+                  (direction == PCM_OUT) ? "playback" : "capture");
+        }
+    }
+
+    ALOGE("%s: no suitable card found", __func__);
+    return -1;
+}
+
 void update_bt_card(struct audio_device *adev){
     adev->bt_card = get_pcm_card(AUDIO_BT_DRIVER_NAME); //update driver name if changed from BT side.
 }
@@ -292,6 +406,18 @@ static int start_output_stream(struct stream_out *out)
     } else {
         ALOGI("PCM playback card selected = %d, \n", adev->card);
         out->pcm = pcm_open(adev->card, PCM_DEVICE, PCM_OUT | PCM_NORESTART | PCM_MONOTONIC, out->pcm_config);
+
+        /* 44100 Hz fallback: retry if pcm_open failed at the default rate */
+        if ((!out->pcm || !pcm_is_ready(out->pcm)) && out->pcm_config->rate != OUT_SAMPLING_RATE_FALLBACK) {
+            ALOGW("%s: pcm_open failed at %dHz, retrying at %dHz",
+                  __func__, out->pcm_config->rate, OUT_SAMPLING_RATE_FALLBACK);
+            if (out->pcm) {
+                pcm_close(out->pcm);
+                out->pcm = NULL;
+            }
+            out->pcm_config->rate = OUT_SAMPLING_RATE_FALLBACK;
+            out->pcm = pcm_open(adev->card, PCM_DEVICE, PCM_OUT | PCM_NORESTART | PCM_MONOTONIC, out->pcm_config);
+        }
     }
 
     if (!out->pcm) {
@@ -327,12 +453,24 @@ static int start_input_stream(struct stream_in *in)
         in->pcm = pcm_open(adev->bt_card, PCM_DEVICE, PCM_IN, &bt_in_config);
 //BT SCO VoIP Call]
     } else {
-        ALOGI("PCM record card selected = %d, \n", adev->card);
+        ALOGI("PCM record card selected = %d, \n", adev->cardc);
 
         ALOGV("%s : config : [rate %d format %d channels %d]",__func__,
             in->pcm_config->rate, in->pcm_config->format, in->pcm_config->channels);
 
         in->pcm = pcm_open(adev->cardc, PCM_DEVICE, PCM_IN, in->pcm_config);
+
+        /* 44100 Hz fallback: retry if pcm_open failed at the default rate */
+        if ((!in->pcm || !pcm_is_ready(in->pcm)) && in->pcm_config->rate != IN_SAMPLING_RATE_FALLBACK) {
+            ALOGW("%s: pcm_open failed at %dHz, retrying at %dHz",
+                  __func__, in->pcm_config->rate, IN_SAMPLING_RATE_FALLBACK);
+            if (in->pcm) {
+                pcm_close(in->pcm);
+                in->pcm = NULL;
+            }
+            in->pcm_config->rate = IN_SAMPLING_RATE_FALLBACK;
+            in->pcm = pcm_open(adev->cardc, PCM_DEVICE, PCM_IN, in->pcm_config);
+        }
     }
 
     if (!in->pcm) {
@@ -639,6 +777,13 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
         free(buf_remapped);
 //BT SCO VoIP Call]
     } else {
+        /* Adaptive buffering: adjust period count based on screen state */
+        if (adev->screen_off && adev->active_in == NULL) {
+            out->pcm_config->period_count = OUT_LONG_PERIOD_COUNT;
+        } else {
+            out->pcm_config->period_count = OUT_SHORT_PERIOD_COUNT;
+        }
+
         /* Normal pcm out to primary card */
         ret = pcm_write(out->pcm, out_buffer, out_frames * frame_size);
 
@@ -1061,30 +1206,14 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 
     int ret;
 
-    adev->card = get_pcm_card("PCH");
-    if (adev->card != -1)
+    adev->card = find_card("vendor.hal.audio.out", PCM_OUT);
+    if (adev->card >= 0)
         params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-    else {
-        adev->card = get_pcm_card("Intel");
-        if (adev->card != -1)
-            params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-	else {
-            adev->card = get_pcm_card("sofhdadsp");
-            if (adev->card != -1)
-                params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-            else {
-                adev->card = get_pcm_card("Dummy");
-                params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-            }
-        }
-    }
+    else
+        params = NULL;
 
-    if (!params) {
-        adev->card = get_pcm_card("Dummy");
-        params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-        if (!params)
-            return -ENOSYS;
-    }
+    if (!params)
+        return -ENOSYS;
 
     ALOGI("PCM playback card selected = %d, \n", adev->card);
     out = (struct stream_out *)calloc(1, sizeof(struct stream_out));
@@ -1195,6 +1324,20 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
         pthread_mutex_unlock(&adev->lock);
     }
 //BT SCO VoIP Call]
+
+    /* Screen state tracking for adaptive buffering */
+    ret = str_parms_get_str(parms, "screen_state", value, sizeof(value));
+    if (ret >= 0) {
+        pthread_mutex_lock(&adev->lock);
+        if (strcmp(value, "off") == 0) {
+            adev->screen_off = true;
+            ALOGV("%s: screen off, switching to long buffer", __func__);
+        } else {
+            adev->screen_off = false;
+            ALOGV("%s: screen on, switching to short buffer", __func__);
+        }
+        pthread_mutex_unlock(&adev->lock);
+    }
 
     str_parms_destroy(parms);
     return 0;
@@ -1336,29 +1479,15 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
 
     *stream_in = NULL;
 
-    adev->cardc = get_pcm_card("PCH");
-    if (adev->cardc != -1)
+    adev->cardc = find_card("vendor.hal.audio.in", PCM_IN);
+    if (adev->cardc >= 0)
         params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-    else {
-        adev->cardc = get_pcm_card("Intel");
-        if (adev->cardc != -1)
-            params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-	else {
-            adev->cardc = get_pcm_card("sofhdadsp");
-            if (adev->cardc != -1)
-                params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-            else {
-                adev->cardc = get_pcm_card("Dummy");
-                params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-            }
-        }
-    }
-    if(!params) {
-        adev->cardc = get_pcm_card("Dummy");
-        params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-        if (!params)
-            return -ENOSYS;
-    }
+    else
+        params = NULL;
+
+    if (!params)
+        return -ENOSYS;
+
     ALOGI("PCM capture card selected = %d, \n", adev->cardc);
 
     in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
@@ -1501,13 +1630,11 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.dump = adev_dump;
     adev->hw_device.get_microphones = adev_get_microphones;
 
-    card = get_pcm_card("PCH");
-    if (card == -1 )
-       card = get_pcm_card("Intel");
-    if (card == -1 )
-       card = get_pcm_card("sofhdadsp");
-    if (card == -1 )
-       card = get_pcm_card("Dummy");
+    card = find_card("vendor.hal.audio.out", PCM_OUT);
+    if (card == -1) {
+       ALOGW("%s: no playback card found, trying any card for mixer", __func__);
+       card = PCM_CARD_DEFAULT;
+    }
 
     snprintf(mixer_path,PATH_MAX,"/vendor/etc/mixer_paths_0.xml");
     adev->ar = audio_route_init(card, mixer_path);
