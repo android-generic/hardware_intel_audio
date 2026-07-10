@@ -335,16 +335,37 @@ static int start_output_stream(struct stream_out *out)
       activePcm = NULL;
     }
 
-    /*TODO - this needs to be updated once the device connect intent sends
-      card, device id*/
     adev->card = hdmi_chosen_output();
+    int parsed_dev = parse_hdmi_device_number();
+    if (parsed_dev >= 0) {
+        adev->device = parsed_dev;
+    }
     
     ALOGD("%s: HDMI card number = %d, device = %d",__func__,adev->card,adev->device);
     out->pcm = pcm_open(adev->card, adev->device, PCM_OUT, &out->pcm_config);
 
-    if (out->pcm && !pcm_is_ready(out->pcm)) {
-        ALOGE("pcm_open() failed: %s", pcm_get_error(out->pcm));
-        pcm_close(out->pcm);
+    if (!out->pcm || !pcm_is_ready(out->pcm)) {
+        if (out->pcm) pcm_close(out->pcm);
+        ALOGW("%s: pcm_open failed for card %d device %d, probing alternative HDMI pins...", __func__, adev->card, adev->device);
+        int hdmi_pins[] = {7, 8, 9, 10, 3};
+        out->pcm = NULL;
+        for (int p = 0; p < 5; p++) {
+            if (hdmi_pins[p] == adev->device) continue;
+            ALOGI("%s: probing fallback HDMI pin %d on card %d", __func__, hdmi_pins[p], adev->card);
+            struct pcm *fallback_pcm = pcm_open(adev->card, hdmi_pins[p], PCM_OUT, &out->pcm_config);
+            if (fallback_pcm && pcm_is_ready(fallback_pcm)) {
+                ALOGI("%s: successfully opened fallback HDMI pin %d on card %d!", __func__, hdmi_pins[p], adev->card);
+                adev->device = hdmi_pins[p];
+                out->pcm = fallback_pcm;
+                break;
+            }
+            if (fallback_pcm) pcm_close(fallback_pcm);
+        }
+    }
+
+    if (!out->pcm || !pcm_is_ready(out->pcm)) {
+        if (out->pcm) pcm_close(out->pcm);
+        ALOGE("pcm_open() failed across all candidate HDMI pins on card %d", adev->card);
         activePcm = NULL;
         return -ENOMEM;
     }
@@ -494,10 +515,7 @@ static int parse_hdmi_device_number()
     struct mixer *mixer = NULL;
     int card = 0;
     struct mixer_ctl *ctl;
-    enum mixer_ctl_type mixer_type;
-    unsigned int num_values;
-    unsigned int i,id,j;
-    bool device_status;
+    unsigned int i, j;
 
     int custom_dev = get_device_output_by_prop();
     if (custom_dev != -1)
@@ -507,39 +525,50 @@ static int parse_hdmi_device_number()
     card = hdmi_chosen_output();
 
     mixer = mixer_open(card);
-    if (mixer == NULL) {
-        ALOGE(" Failed to open mixer\n");
-        return -1;
-    }
-    for (i = 0; i < MAX_HDMI_DEVICES; i++) {
-       char ctl_name[100] ;
-       enum mixer_ctl_type type;
-       unsigned int num_values;
-       snprintf(ctl_name, sizeof(ctl_name), "HDMI/DP,pcm=%d Jack", i);
-       ctl = mixer_get_ctl_by_name(mixer, ctl_name);
-       if (ctl) {
-           type = mixer_ctl_get_type(ctl);
-           num_values = mixer_ctl_get_num_values(ctl);  
-           for (j = 0; j < num_values; j++) {
-               switch (type) {
-                   case MIXER_CTL_TYPE_BOOL:
-                   ALOGV("mixer_ctl_get_value %s", mixer_ctl_get_value(ctl, j) ? "On" : "Off");
-                   if (mixer_ctl_get_value(ctl, j)) {
-                       ALOGV(" status of device %d is ON", i);
-                       ALOGV("%s exit", __func__);
+    if (mixer != NULL) {
+        for (i = 0; i < MAX_HDMI_DEVICES; i++) {
+           char ctl_name[100];
+           snprintf(ctl_name, sizeof(ctl_name), "HDMI/DP,pcm=%d Jack", i);
+           ctl = mixer_get_ctl_by_name(mixer, ctl_name);
+           if (ctl) {
+               enum mixer_ctl_type type = mixer_ctl_get_type(ctl);
+               unsigned int num_values = mixer_ctl_get_num_values(ctl);
+               for (j = 0; j < num_values; j++) {
+                   if (type == MIXER_CTL_TYPE_BOOL && mixer_ctl_get_value(ctl, j)) {
+                       ALOGI("parse_hdmi_device_number: Jack control '%s' is ON -> device %d", ctl_name, i);
                        mixer_close(mixer);
                        return i;
                    }
-                   break;
-
-                   default:
-                   break;
                }
-           }   
-       }
+           }
+        }
+        mixer_close(mixer);
     }
-    mixer_close(mixer);
-    ALOGV("%s exit",__func__);
+
+    // Fallback: Check ELD monitor status in /proc/asound/cardX/eld#device.subdevice
+    int candidate_pins[] = {7, 8, 9, 10, 3};
+    for (int p = 0; p < 5; p++) {
+        char eld_path[128];
+        snprintf(eld_path, sizeof(eld_path), "/proc/asound/card%d/eld#%d.0", card, candidate_pins[p]);
+        FILE *fp = fopen(eld_path, "r");
+        if (fp) {
+            char line[128];
+            bool monitor_present = false;
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "monitor_present") && strstr(line, "1")) {
+                    monitor_present = true;
+                    break;
+                }
+            }
+            fclose(fp);
+            if (monitor_present) {
+                ALOGI("parse_hdmi_device_number: found monitor_present 1 in %s -> device %d", eld_path, candidate_pins[p]);
+                return candidate_pins[p];
+            }
+        }
+    }
+
+    ALOGV("%s exit defaulting to %d", __func__, DEFAULT_DEVICE);
     return DEFAULT_DEVICE;
 }
 static int parse_channel_map()
@@ -946,9 +975,28 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
 
 static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 {
-    UNUSED_PARAMETER(dev);
-    UNUSED_PARAMETER(kvpairs);
-
+    struct audio_device *adev = (struct audio_device *)dev;
+    ALOGD("%s: kvpairs: %s", __func__, kvpairs);
+    struct str_parms *parms = str_parms_create_str(kvpairs);
+    if (!parms) return 0;
+    char value[32];
+    if (str_parms_get_str(parms, "routing_override", value, sizeof(value)) >= 0) {
+        if (strcmp(value, "hdmi") == 0 || strcmp(value, "usb") == 0 || strcmp(value, "speaker") == 0) {
+            property_set("persist.audio.output.route", value);
+        }
+        if (strcmp(value, "hdmi") != 0 && activePcm) {
+            ALOGD("%s: routing_override=%s (not hdmi), putting hdmi out in standby", __func__, value);
+            pcm_close(activePcm);
+            activePcm = NULL;
+        }
+    }
+    if (str_parms_get_str(parms, "card", value, sizeof(value)) >= 0) {
+        adev->card = atoi(value);
+    }
+    if (str_parms_get_str(parms, "device", value, sizeof(value)) >= 0) {
+        adev->device = atoi(value);
+    }
+    str_parms_destroy(parms);
     return 0;
 }
 

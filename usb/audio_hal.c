@@ -217,9 +217,13 @@ static void apply_mixer_settings(int card)
     struct audio_route *ar;
 
     snprintf(mixer_path,PATH_MAX, "/vendor/etc/mixer_paths_usb.xml");
+    if (access(mixer_path, R_OK) != 0) {
+        ALOGI("apply_mixer_settings: %s not found for USB card %d; bypassing XML mixer routing.", mixer_path, card);
+        return;
+    }
     ar = audio_route_init(card, mixer_path);
     if (!ar) {
-        ALOGE("Failed to init audio route controls for card %d", card);
+        ALOGW("apply_mixer_settings: Failed to init audio route controls for card %d (card may have no ALSA mixer controls; continuing)", card);
         return;
     }
     audio_route_apply_path(ar, "usb_headset");
@@ -697,6 +701,25 @@ static int adev_open_output_stream(struct audio_hw_device *hw_dev,
 
     /* Pull out the card/device pair */
     parse_card_device_params(address, &out->adev->out_profile.card, &out->adev->out_profile.device);
+    if (out->adev->out_profile.card < 0 || out->adev->out_profile.device < 0) {
+        if (out->adev->usbcard >= 0) {
+            out->adev->out_profile.card = out->adev->usbcard;
+            out->adev->out_profile.device = 0;
+            ALOGI("adev_open_output_stream: fallback using adev->usbcard=%d device=0", out->adev->out_profile.card);
+        } else {
+            for (int c = 1; c < 16; c++) {
+                char path[64];
+                snprintf(path, sizeof(path), "/dev/snd/pcmC%dD0p", c);
+                if (access(path, F_OK) == 0) {
+                    out->adev->out_profile.card = c;
+                    out->adev->out_profile.device = 0;
+                    out->adev->usbcard = c;
+                    ALOGI("adev_open_output_stream: auto-detected USB card=%d device=0 at %s", c, path);
+                    break;
+                }
+            }
+        }
+    }
 
     profile_read_device_info(&out->adev->out_profile);
 
@@ -1075,9 +1098,29 @@ static int adev_open_input_stream(struct audio_hw_device *hw_dev,
     /* Pull out the card/device pair */
     int32_t card, device;
     if (!parse_card_device_params(address, &card, &device)) {
-        ALOGW("%s fail - invalid address %s", __func__, address);
-        *stream_in = NULL;
-        return -EINVAL;
+        if (dev->usbcard >= 0) {
+            card = dev->usbcard;
+            device = 0;
+            ALOGI("adev_open_input_stream: fallback using dev->usbcard=%d device=0", card);
+        } else {
+            card = -1;
+            for (int c = 1; c < 16; c++) {
+                char path[64];
+                snprintf(path, sizeof(path), "/dev/snd/pcmC%dD0c", c);
+                if (access(path, F_OK) == 0) {
+                    card = c;
+                    device = 0;
+                    dev->usbcard = c;
+                    ALOGI("adev_open_input_stream: auto-detected USB card=%d device=0 at %s", c, path);
+                    break;
+                }
+            }
+            if (card < 0) {
+                ALOGW("%s fail - invalid address %s and no USB capture card detected", __func__, address);
+                *stream_in = NULL;
+                return -EINVAL;
+            }
+        }
     }
 
     struct stream_in * const in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
